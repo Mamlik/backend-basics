@@ -1,0 +1,770 @@
+openapi: 3.1.0
+info:
+  title: Library API
+  version: 1.0.0
+  description: |
+    Контракт сервиса «Библиотека»: книги, читатели и выдачи.
+    Все операции требуют Bearer JWT. Токен выдаётся внешним сервисом авторизации.
+    Идентификаторы — положительные целые числа. Даты имеют формат YYYY-MM-DD,
+    временные метки — RFC 3339 в UTC. Текущая дата для бизнес-правил определяется в UTC.
+    При равных значениях поля сортировки записи дополнительно сортируются по id ASC.
+    Проверки доступности экземпляров, лимита читателя и изменение выдач атомарны:
+    конкурентные запросы не могут выдать один экземпляр дважды или превысить лимит.
+servers:
+  - url: https://library.example.com/v1
+    description: Пример адреса API; работающий сервер в рамках задания не развёрнут.
+security:
+  - bearerAuth: []
+tags:
+  - name: Books
+    description: Каталог книг и количество экземпляров.
+  - name: Readers
+    description: Зарегистрированные читатели.
+  - name: Loans
+    description: Выдача и возврат книг.
+
+paths:
+  /books:
+    get:
+      tags: [Books]
+      operationId: listBooks
+      summary: Получить список книг
+      description: Все фильтры объединяются по AND. Без совпадений возвращается пустой items.
+      parameters:
+        - name: title
+          in: query
+          description: Часть названия без учёта регистра.
+          schema: {type: string, minLength: 1, maxLength: 200}
+        - name: author
+          in: query
+          description: Часть имени автора без учёта регистра.
+          schema: {type: string, minLength: 1, maxLength: 200}
+        - name: available_only
+          in: query
+          description: При true включать только книги с available_copies > 0.
+          schema: {type: boolean, default: false}
+        - name: sort
+          in: query
+          description: Поле сортировки; знак минус означает убывание.
+          schema:
+            type: string
+            enum: [id, '-id', title, '-title', published_year, '-published_year']
+            default: id
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Страница книг; total учитывает фильтры до применения пагинации.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BookList'}
+              examples:
+                empty:
+                  value: {items: [], total: 0, limit: 20, offset: 0}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    post:
+      tags: [Books]
+      operationId: createBook
+      summary: Добавить книгу
+      description: ISBN уникален. При создании available_copies равно total_copies.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateBookRequest'}
+            examples:
+              book:
+                value:
+                  title: Мастер и Маргарита
+                  author: Михаил Булгаков
+                  isbn: '9785170906302'
+                  published_year: 1967
+                  total_copies: 3
+      responses:
+        '201':
+          description: Книга создана.
+          headers:
+            Location:
+              description: URL созданной книги.
+              schema: {type: string, format: uri-reference}
+              example: /v1/books/1
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Book'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /books/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [Books]
+      operationId: getBook
+      summary: Получить книгу по ID
+      description: Вернуть все поля книги, включая вычисленное available_copies.
+      responses:
+        '200':
+          description: Книга найдена.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Book'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    patch:
+      tags: [Books]
+      operationId: updateBook
+      summary: Изменить книгу
+      description: |
+        Изменяются только переданные поля; пустой объект и null запрещены.
+        ISBN должен оставаться уникальным (409 CONFLICT).
+        total_copies нельзя уменьшить ниже числа активных выдач
+        (422 BUSINESS_RULE_VIOLATION). available_copies пересчитывается сервером.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateBookRequest'}
+      responses:
+        '200':
+          description: Книга изменена.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Book'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    delete:
+      tags: [Books]
+      operationId: deleteBook
+      summary: Удалить книгу
+      description: |
+        При активных выдачах удаление запрещено (409 BUSINESS_RULE_VIOLATION).
+        История завершённых выдач сохраняется с прежним book_id.
+      responses:
+        '204':
+          description: Книга удалена; тело ответа отсутствует.
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /readers:
+    get:
+      tags: [Readers]
+      operationId: listReaders
+      summary: Получить список читателей
+      description: Фильтры объединяются по AND; отсутствие совпадений не является ошибкой.
+      parameters:
+        - name: full_name
+          in: query
+          description: Часть ФИО без учёта регистра.
+          schema: {type: string, minLength: 1, maxLength: 200}
+        - name: email
+          in: query
+          description: Точное совпадение email без учёта регистра.
+          schema: {type: string, format: email, maxLength: 254}
+        - name: sort
+          in: query
+          description: Поле сортировки; знак минус означает убывание.
+          schema:
+            type: string
+            enum: [id, '-id', full_name, '-full_name', registered_at, '-registered_at']
+            default: id
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Страница читателей; total учитывает фильтры до пагинации.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReaderList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    post:
+      tags: [Readers]
+      operationId: createReader
+      summary: Зарегистрировать читателя
+      description: Email уникален без учёта регистра; registered_at устанавливается сервером.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateReaderRequest'}
+            examples:
+              reader:
+                value: {full_name: Иван Петров, email: ivan@example.com}
+      responses:
+        '201':
+          description: Читатель зарегистрирован.
+          headers:
+            Location:
+              description: URL созданного читателя.
+              schema: {type: string, format: uri-reference}
+              example: /v1/readers/1
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Reader'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /readers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [Readers]
+      operationId: getReader
+      summary: Получить читателя по ID
+      description: Вернуть сведения о зарегистрированном читателе.
+      responses:
+        '200':
+          description: Читатель найден.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Reader'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    patch:
+      tags: [Readers]
+      operationId: updateReader
+      summary: Изменить читателя
+      description: |
+        Изменяются только переданные поля; пустой объект и null запрещены.
+        При занятом email возвращается 409 CONFLICT.
+        id и registered_at не изменяются клиентом.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateReaderRequest'}
+      responses:
+        '200':
+          description: Читатель изменён.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Reader'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    delete:
+      tags: [Readers]
+      operationId: deleteReader
+      summary: Удалить читателя
+      description: |
+        При активных выдачах удаление запрещено (409 BUSINESS_RULE_VIOLATION).
+        История завершённых выдач сохраняется с прежним reader_id.
+      responses:
+        '204':
+          description: Читатель удалён; тело ответа отсутствует.
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /loans:
+    get:
+      tags: [Loans]
+      operationId: listLoans
+      summary: Получить список выдач
+      description: |
+        Фильтры объединяются по AND. Без status возвращаются все выдачи.
+        active: returned_at == null, включая просроченные;
+        returned: returned_at != null;
+        overdue: returned_at == null и due_date раньше текущей даты UTC.
+        В день due_date выдача ещё не считается просроченной.
+      parameters:
+        - name: book_id
+          in: query
+          description: Фильтр по книге.
+          schema: {type: integer, minimum: 1}
+        - name: reader_id
+          in: query
+          description: Фильтр по читателю.
+          schema: {type: integer, minimum: 1}
+        - name: status
+          in: query
+          description: Состояние выдачи.
+          schema: {type: string, enum: [active, returned, overdue]}
+        - name: sort
+          in: query
+          description: Поле сортировки; знак минус означает убывание.
+          schema:
+            type: string
+            enum: [id, '-id', loaned_at, '-loaned_at', due_date, '-due_date']
+            default: id
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Страница выдач; total учитывает фильтры до пагинации.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LoanList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    post:
+      tags: [Loans]
+      operationId: createLoan
+      summary: Выдать книгу читателю
+      description: |
+        Книга и читатель должны существовать (404 NOT_FOUND).
+        Выдача разрешена только при available_copies > 0 и менее 5 активных
+        выдачах читателя; иначе 409 BUSINESS_RULE_VIOLATION.
+        due_date должна быть позже текущей даты UTC; иначе 422 BUSINESS_RULE_VIOLATION.
+        Сервер устанавливает loaned_at и returned_at = null, уменьшает available_copies.
+
+        Idempotency-Key обязателен. Ключ ограничен сочетанием JWT sub,
+        HTTP-метода и пути операции. После проверки токена и структуры запроса
+        ключ атомарно резервируется вместе с нормализованным JSON-телом:
+        порядок полей и пробелы в JSON не влияют на сравнение.
+        Один ключ с другим телом возвращает 409 IDEMPOTENCY_MISMATCH.
+        Одновременный запрос с тем же ключом и телом во время обработки
+        получает 409 CONFLICT с Retry-After: 1; вторая выдача не создаётся.
+
+        Завершённый результат (201 или бизнес-ошибка 404/409/422) хранится
+        24 часа с момента завершения. В течение этого срока повтор с тем же
+        ключом и телом возвращает исходный HTTP-статус, JSON-тело целиком
+        (включая request_id у ошибки) и заголовки операции, включая Location.
+        Бизнес-правила при replay заново не проверяются, TTL не продлевается.
+        Транспортные заголовки вроде Date могут отличаться.
+        Ошибки 400/401, структурные ошибки 422, временный конфликт обработки
+        и mismatch не сохраняются как результат и не заменяют исходный ответ.
+        После истечения TTL ключ считается новым: запрос может создать новую выдачу.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateLoanRequest'}
+            examples:
+              loan:
+                value: {book_id: 1, reader_id: 1, due_date: '2030-12-01'}
+      responses:
+        '201':
+          description: Выдача создана либо полностью повторён сохранённый ответ 201.
+          headers:
+            Location:
+              description: URL созданной выдачи; при replay сохраняется исходное значение.
+              schema: {type: string, format: uri-reference}
+              example: /v1/loans/1
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Loan'}
+              examples:
+                issued:
+                  value:
+                    id: 1
+                    book_id: 1
+                    reader_id: 1
+                    loaned_at: '2030-11-01T10:00:00Z'
+                    due_date: '2030-12-01'
+                    returned_at: null
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: Нет экземпляров, превышен лимит читателя или конфликт Idempotency-Key.
+          headers:
+            Retry-After:
+              description: Присутствует только при обработке того же ключа другим запросом.
+              schema: {type: integer, minimum: 1}
+              example: 1
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+              examples:
+                unavailable:
+                  value:
+                    code: BUSINESS_RULE_VIOLATION
+                    message: Нет доступных экземпляров книги.
+                    request_id: req-loan-001
+                reader_limit:
+                  value:
+                    code: BUSINESS_RULE_VIOLATION
+                    message: У читателя уже пять активных выдач.
+                    request_id: req-loan-002
+                mismatch:
+                  value:
+                    code: IDEMPOTENCY_MISMATCH
+                    message: Этот Idempotency-Key использован с другим телом запроса.
+                    request_id: req-loan-003
+                in_progress:
+                  value:
+                    code: CONFLICT
+                    message: Запрос с этим ключом ещё обрабатывается. Повторите через секунду.
+                    request_id: req-loan-004
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /loans/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [Loans]
+      operationId: getLoan
+      summary: Получить выдачу по ID
+      description: Вернуть активную или завершённую выдачу.
+      responses:
+        '200':
+          description: Выдача найдена.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Loan'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+  /loans/{id}/return:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [Loans]
+      operationId: returnLoan
+      summary: Зарегистрировать возврат книги
+      description: |
+        Запрос не содержит тела. Сервер устанавливает returned_at в текущее время UTC
+        и увеличивает available_copies. Изменение выполняется атомарно.
+        Для уже возвращённой книги операция возвращает ту же выдачу с исходным
+        returned_at: счётчик экземпляров повторно не увеличивается.
+      responses:
+        '200':
+          description: Возврат зарегистрирован либо выдача уже была завершена.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Loan'}
+              examples:
+                returned:
+                  value:
+                    id: 1
+                    book_id: 1
+                    reader_id: 1
+                    loaned_at: '2030-11-01T10:00:00Z'
+                    due_date: '2030-12-01'
+                    returned_at: '2030-11-10T12:00:00Z'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Передать Authorization: Bearer <JWT>. Все операции доступны только с валидным
+        токеном доверенного сервиса авторизации. Сервер проверяет подпись, срок действия,
+        issuer и audience. Токен обязан содержать непустой sub — идентификатор
+        пользователя для области Idempotency-Key. Отсутствующий, некорректный
+        или просроченный токен даёт 401.
+        Выпуск токенов и отдельные роли не входят в этот контракт.
+
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      description: Положительный идентификатор ресурса.
+      schema: {type: integer, minimum: 1}
+      example: 1
+    Limit:
+      name: limit
+      in: query
+      description: Максимальное число записей на странице.
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+    Offset:
+      name: offset
+      in: query
+      description: Число пропускаемых записей после фильтрации и сортировки.
+      schema: {type: integer, minimum: 0, default: 0}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Уникальный ключ операции. Используйте новый UUID для новой выдачи,
+        а при повторе запроса передавайте прежний ключ. TTL результата — 24 часа.
+        Отсутствующий заголовок даёт 400 INVALID_REQUEST.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._-]+$'
+      example: 9f88d329-d776-4a56-a818-b8d2b1054876
+
+  schemas:
+    Book:
+      type: object
+      required: [id, title, author, isbn, published_year, total_copies, available_copies]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          readOnly: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+        author:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+        isbn:
+          type: string
+          pattern: '^([0-9]{13}|[0-9]{9}[0-9X])$'
+          description: Уникальный ISBN-10 или ISBN-13 без пробелов и дефисов.
+        published_year:
+          type: integer
+          minimum: 1
+          maximum: 9999
+          description: Год публикации; не позже текущего года UTC (проверяет сервер).
+        total_copies:
+          type: integer
+          minimum: 0
+        available_copies:
+          type: integer
+          minimum: 0
+          readOnly: true
+          description: total_copies минус число активных выдач; не превышает total_copies.
+    CreateBookRequest:
+      type: object
+      additionalProperties: false
+      required: [title, author, isbn, published_year, total_copies]
+      properties:
+        title: {$ref: '#/components/schemas/Book/properties/title'}
+        author: {$ref: '#/components/schemas/Book/properties/author'}
+        isbn: {$ref: '#/components/schemas/Book/properties/isbn'}
+        published_year: {$ref: '#/components/schemas/Book/properties/published_year'}
+        total_copies: {$ref: '#/components/schemas/Book/properties/total_copies'}
+    UpdateBookRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title: {$ref: '#/components/schemas/Book/properties/title'}
+        author: {$ref: '#/components/schemas/Book/properties/author'}
+        isbn: {$ref: '#/components/schemas/Book/properties/isbn'}
+        published_year: {$ref: '#/components/schemas/Book/properties/published_year'}
+        total_copies: {$ref: '#/components/schemas/Book/properties/total_copies'}
+
+    Reader:
+      type: object
+      required: [id, full_name, email, registered_at]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          readOnly: true
+        full_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Уникален без учёта регистра.
+        registered_at:
+          type: string
+          format: date-time
+          readOnly: true
+          description: Дата и время регистрации в UTC, устанавливаются сервером.
+    CreateReaderRequest:
+      type: object
+      additionalProperties: false
+      required: [full_name, email]
+      properties:
+        full_name: {$ref: '#/components/schemas/Reader/properties/full_name'}
+        email: {$ref: '#/components/schemas/Reader/properties/email'}
+    UpdateReaderRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        full_name: {$ref: '#/components/schemas/Reader/properties/full_name'}
+        email: {$ref: '#/components/schemas/Reader/properties/email'}
+
+    Loan:
+      type: object
+      required: [id, book_id, reader_id, loaned_at, due_date, returned_at]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          readOnly: true
+        book_id:
+          type: integer
+          minimum: 1
+        reader_id:
+          type: integer
+          minimum: 1
+        loaned_at:
+          type: string
+          format: date-time
+          readOnly: true
+          description: Время выдачи в UTC, устанавливается сервером.
+        due_date:
+          type: string
+          format: date
+          description: При создании должна быть позже текущей даты UTC (проверяет сервер).
+        returned_at:
+          type: [string, 'null']
+          format: date-time
+          readOnly: true
+          description: Время возврата в UTC; null означает активную выдачу.
+    CreateLoanRequest:
+      type: object
+      additionalProperties: false
+      required: [book_id, reader_id, due_date]
+      properties:
+        book_id: {$ref: '#/components/schemas/Loan/properties/book_id'}
+        reader_id: {$ref: '#/components/schemas/Loan/properties/reader_id'}
+        due_date: {$ref: '#/components/schemas/Loan/properties/due_date'}
+
+    BookList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Book'}
+        total: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, minimum: 0}
+    ReaderList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Reader'}
+        total: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, minimum: 0}
+    LoanList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Loan'}
+        total: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        offset: {type: integer, minimum: 0}
+
+    ErrorResponse:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - NOT_FOUND
+            - VALIDATION_ERROR
+            - CONFLICT
+            - BUSINESS_RULE_VIOLATION
+            - IDEMPOTENCY_MISMATCH
+            - UNAUTHORIZED
+        message:
+          type: string
+          minLength: 1
+          description: Понятное человеку описание; клиент определяет тип ошибки по code.
+        request_id:
+          type: string
+          minLength: 1
+          description: Идентификатор запроса для диагностики; при replay сохраняется исходный.
+
+  responses:
+    BadRequest:
+      description: |
+        400 INVALID_REQUEST: некорректный JSON, отсутствует Idempotency-Key,
+        либо передано тело там, где оно запрещено.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            invalid_request:
+              value:
+                code: INVALID_REQUEST
+                message: Некорректный JSON или отсутствует обязательный заголовок.
+                request_id: req-400-001
+    Unauthorized:
+      description: 401 UNAUTHORIZED — Bearer JWT отсутствует, некорректен или просрочен.
+      headers:
+        WWW-Authenticate:
+          description: Требуемая схема аутентификации.
+          schema: {type: string}
+          example: Bearer
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            unauthorized:
+              value:
+                code: UNAUTHORIZED
+                message: Требуется действующий Bearer JWT.
+                request_id: req-401-001
+    NotFound:
+      description: 404 NOT_FOUND — запрошенная книга, читатель или выдача не найдены.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            not_found:
+              value:
+                code: NOT_FOUND
+                message: Ресурс с указанным ID не найден.
+                request_id: req-404-001
+    Conflict:
+      description: |
+        409 CONFLICT: ISBN или email уже занят.
+        409 BUSINESS_RULE_VIOLATION: удаление книги/читателя с активными выдачами.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            duplicate:
+              value:
+                code: CONFLICT
+                message: Ресурс с таким ISBN или email уже существует.
+                request_id: req-409-001
+            active_loans:
+              value:
+                code: BUSINESS_RULE_VIOLATION
+                message: Нельзя удалить ресурс с активными выдачами.
+                request_id: req-409-002
+    ValidationError:
+      description: |
+        422 VALIDATION_ERROR: неверные типы, форматы, диапазоны, неизвестные поля,
+        отсутствующие обязательные поля или пустой PATCH.
+        422 BUSINESS_RULE_VIOLATION: due_date не позже текущей даты,
+        published_year позже текущего года или total_copies меньше числа активных выдач.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          examples:
+            invalid_field:
+              value:
+                code: VALIDATION_ERROR
+                message: Передано неизвестное поле или неверное значение поля.
+                request_id: req-422-001
+            business_rule:
+              value:
+                code: BUSINESS_RULE_VIOLATION
+                message: Значение нарушает правила даты или количества экземпляров.
+                request_id: req-422-002
